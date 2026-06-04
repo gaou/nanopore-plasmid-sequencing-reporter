@@ -1,0 +1,64 @@
+# Local installations and downloaded third-party software
+/envs/
+/tools/
+
+# Run outputs and logs
+/results/
+/logs/
+
+# Large sequencing inputs and intermediates
+*.pod5
+*.fast5
+*.bam
+*.sam
+*.fastq
+*.fq
+*.fastq.gz
+*.fq.gz
+
+# Downloaded functional annotation databases/resources
+/resources/functional_annotation_db/
+/resources/**/*.dmnd
+/resources/**/*.nhr
+/resources/**/*.nin
+/resources/**/*.nsq
+/resources/**/*.ntf
+/resources/**/*.nto
+/resources/**/*.cm
+/resources/**/*.i1f
+/resources/**/*.i1i
+/resources/**/*.i1m
+/resources/**/*.i1p
+
+# Python/cache/editor files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+*~
+
+# secrets
+.env
+.env.*
+
+# logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node.js
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# build outputs
+dist/
+build/
