@@ -73,16 +73,17 @@ Typical GUI workflow:
 
 1. Click `Browse...` beside `Run folder`.
 2. Select the ONT run directory. You can select the folder that directly contains `pod5/`, or a parent folder; the software searches recursively for `.pod5` files.
-3. Leave `Kit` as `SQK-RBK114-24` for rapid barcode 114.24 plasmid runs.
-4. Choose the Dorado model:
+3. Optional: choose an existing demultiplexed FASTQ folder in `Existing demux FASTQs`. Use this when a previous MinKNOW/Guppy/Dorado basecalling output already contains folders such as `basecalling/pass/barcode04/*.fastq.gz`. When this is set, the pipeline skips basecalling and demultiplexing.
+4. Leave `Kit` as `SQK-RBK114-24` for rapid barcode 114.24 plasmid runs.
+5. Choose the Dorado model:
    - `sup`: best accuracy, slowest.
    - `hac`: faster, lower accuracy.
    - `fast`: fastest, lowest accuracy.
-5. Set threads according to the machine.
-6. Click `Run Pipeline`.
-7. Watch the progress bar and task table.
-8. When the run finishes, select barcodes in the left panel to view the plasmid PNG map and representative FASTA.
-9. Click `Save As...` to write a zip package for sharing or archiving.
+6. Set threads according to the machine.
+7. Click `Run Pipeline`.
+8. Watch the progress bar and task table.
+9. When the run finishes, select barcodes in the left panel to view the plasmid PNG map and representative FASTA.
+10. Click `Save As...` to write a zip package for sharing or archiving.
 
 The GUI result package includes:
 
@@ -126,6 +127,18 @@ envs/plasmid-pipeline/bin/python bin/plasmid_pipeline.py \
   --basecalled-bam results/previous_run/01_basecalling/calls.bam \
   --demux-dir results/previous_run/02_demux \
   --output results/reused_dorado_run
+```
+
+Reuse an existing demultiplexed FASTQ directory without a BAM file:
+
+```bash
+envs/plasmid-pipeline/bin/python bin/plasmid_pipeline.py \
+  --input-run /path/to/run \
+  --demux-dir /path/to/run/basecalling/pass \
+  --kit-name SQK-RBK114-24 \
+  --model sup \
+  --threads 16 \
+  --output results/reused_fastq_run
 ```
 
 Use CPU basecalling:

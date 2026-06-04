@@ -72,6 +72,7 @@ class PipelineGui(tk.Tk):
 
         self.run_folder = tk.StringVar(value=str(ROOT))
         self.output_folder = tk.StringVar(value="")
+        self.demux_folder = tk.StringVar(value="")
         self.kit_name = tk.StringVar(value="SQK-RBK114-24")
         self.model = tk.StringVar(value="sup")
         self.threads = tk.IntVar(value=max(1, (os.cpu_count() or 1) // 2))
@@ -99,8 +100,12 @@ class PipelineGui(tk.Tk):
         ttk.Entry(controls, textvariable=self.output_folder).grid(row=1, column=1, sticky="ew", padx=8, pady=(6, 0))
         ttk.Button(controls, text="Browse...", command=self.choose_output_folder).grid(row=1, column=2, pady=(6, 0))
 
+        ttk.Label(controls, text="Existing demux FASTQs").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(controls, textvariable=self.demux_folder).grid(row=2, column=1, sticky="ew", padx=8, pady=(6, 0))
+        ttk.Button(controls, text="Browse...", command=self.choose_demux_folder).grid(row=2, column=2, pady=(6, 0))
+
         options = ttk.Frame(controls)
-        options.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        options.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         ttk.Label(options, text="Kit").pack(side=LEFT)
         ttk.Entry(options, textvariable=self.kit_name, width=18).pack(side=LEFT, padx=(4, 14))
         ttk.Label(options, text="Model").pack(side=LEFT)
@@ -114,7 +119,7 @@ class PipelineGui(tk.Tk):
         ttk.Checkbutton(options, text="Skip Dorado update check", variable=self.skip_dorado_update).pack(side=LEFT)
 
         buttons = ttk.Frame(controls)
-        buttons.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        buttons.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         self.run_button = ttk.Button(buttons, text="Run Pipeline", command=self.run_pipeline)
         self.run_button.pack(side=LEFT)
         self.stop_button = ttk.Button(buttons, text="Stop", command=self.stop_pipeline, state="disabled")
@@ -187,6 +192,11 @@ class PipelineGui(tk.Tk):
         if folder:
             self.output_folder.set(folder)
 
+    def choose_demux_folder(self) -> None:
+        folder = filedialog.askdirectory(initialdir=self.run_folder.get() or str(ROOT), title="Select existing demultiplexed FASTQ folder")
+        if folder:
+            self.demux_folder.set(folder)
+
     def default_output(self) -> Path:
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
         return ROOT / "results" / f"plasmid_pipeline_gui_{stamp}"
@@ -226,6 +236,12 @@ class PipelineGui(tk.Tk):
         ]
         if self.skip_dorado_update.get():
             cmd.append("--skip-dorado-update")
+        if self.demux_folder.get().strip():
+            demux_dir = Path(self.demux_folder.get()).expanduser()
+            if not demux_dir.exists():
+                messagebox.showerror("Demux folder not found", f"Folder does not exist:\n{demux_dir}")
+                return
+            cmd.extend(["--demux-dir", str(demux_dir)])
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         env = os.environ.copy()

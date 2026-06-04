@@ -18,6 +18,7 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+from collections import defaultdict
 from pathlib import Path
 
 
@@ -197,18 +198,23 @@ def qscore(qual: str) -> float:
     return sum(ord(c) - 33 for c in qual) / len(qual)
 
 
-def write_filtered_fastq(src: Path, dst: Path, min_len: int, min_q: float) -> dict:
+def write_filtered_fastqs(srcs: list[Path], dst: Path, min_len: int, min_q: float) -> dict:
     n = kept = bases = 0
     lengths = []
     with dst.open("w") as out:
-        for name, seq, qual in fastq_records(src):
-            n += 1
-            if len(seq) >= min_len and qscore(qual) >= min_q:
-                kept += 1
-                bases += len(seq)
-                lengths.append(len(seq))
-                out.write(f"{name}\n{seq}\n+\n{qual}\n")
+        for src in srcs:
+            for name, seq, qual in fastq_records(src):
+                n += 1
+                if len(seq) >= min_len and qscore(qual) >= min_q:
+                    kept += 1
+                    bases += len(seq)
+                    lengths.append(len(seq))
+                    out.write(f"{name}\n{seq}\n+\n{qual}\n")
     return {"raw_reads": n, "kept_reads": kept, "kept_bases": bases, "n50": n50(lengths)}
+
+
+def write_filtered_fastq(src: Path, dst: Path, min_len: int, min_q: float) -> dict:
+    return write_filtered_fastqs([src], dst, min_len, min_q)
 
 
 def n50(lengths: list[int]) -> int:
@@ -436,6 +442,10 @@ def demux_fastqs(demux_dir: Path) -> list[Path]:
 
 
 def barcode_name(path: Path) -> str:
+    for part in (path.name, *reversed(path.parts[:-1])):
+        m = re.search(r"^(barcode\d{2,3}|unclassified)(?:\b|[._-])", part, re.I)
+        if m:
+            return m.group(1).lower()
     m = re.search(r"(barcode\d{2,3}|unclassified)", path.name, re.I)
     return m.group(1).lower() if m else path.stem
 
@@ -568,7 +578,12 @@ def main() -> int:
         pod5_dir = run_dir / "pod5"
     completed, failed, pending = [], [], []
 
-    if args.basecalled_bam:
+    if args.demux_dir and not args.basecalled_bam:
+        calls_bam = None
+        completed.append(f"Skipped basecalling; reused demultiplexed FASTQs: {args.demux_dir.resolve()}")
+        progress_event(progress_path, "basecalling", "completed", 0.18,
+                       f"Skipping basecalling because demux FASTQs were provided: {args.demux_dir.resolve()}")
+    elif args.basecalled_bam:
         calls_bam = args.basecalled_bam.resolve()
         completed.append(f"Reused basecalled BAM: {calls_bam}")
         progress_event(progress_path, "basecalling", "completed", 0.18, f"Reusing basecalled BAM: {calls_bam}")
@@ -603,17 +618,20 @@ def main() -> int:
     progress_event(progress_path, "barcode_filtering", "running", 0.30, "Counting demultiplexed reads by barcode")
     fastqs = demux_fastqs(demux_dir)
     used_barcodes = sample_sheet_barcodes(run_dir)
-    counts = []
+    grouped_fastqs: dict[str, list[Path]] = defaultdict(list)
     for fq in fastqs:
-        raw = sum(1 for _ in fastq_records(fq))
-        counts.append((barcode_name(fq), fq, raw))
+        grouped_fastqs[barcode_name(fq)].append(fq)
+    counts = []
+    for bc, paths in sorted(grouped_fastqs.items()):
+        raw = sum(1 for fq in paths for _ in fastq_records(fq))
+        counts.append((bc, paths, raw))
     classified_counts = [raw for bc, _, raw in counts if bc != "unclassified"]
     max_reads = max(classified_counts, default=0)
     accepted = []
     barcode_table = out / "barcode_filtering.tsv"
     with barcode_table.open("w") as table:
-        table.write("barcode\tfastq\traw_reads\tdecision\treason\n")
-        for bc, fq, raw in counts:
+        table.write("barcode\tfastq_files\traw_reads\tdecision\treason\n")
+        for bc, fqs, raw in counts:
             reasons = []
             if bc == "unclassified":
                 reasons.append("unclassified")
@@ -624,9 +642,9 @@ def main() -> int:
             if used_barcodes and bc not in {b.lower() for b in used_barcodes}:
                 reasons.append("not_in_sample_sheet")
             decision = "accepted" if not reasons else "rejected"
-            table.write(f"{bc}\t{fq}\t{raw}\t{decision}\t{';'.join(reasons)}\n")
+            table.write(f"{bc}\t{';'.join(str(fq) for fq in fqs)}\t{raw}\t{decision}\t{';'.join(reasons)}\n")
             if decision == "accepted":
-                accepted.append((bc, fq, raw))
+                accepted.append((bc, fqs, raw))
     completed.append(f"Barcode abundance filtering: {barcode_table}")
     progress_event(progress_path, "barcode_filtering", "completed", 0.36,
                    f"Accepted {len(accepted)} barcode bins after abundance filtering")
@@ -634,7 +652,7 @@ def main() -> int:
     final_records = []
     per_barcode = []
     total_accepted = max(1, len(accepted))
-    for index, (bc, fq, raw) in enumerate(accepted, start=1):
+    for index, (bc, fqs, raw) in enumerate(accepted, start=1):
         base_progress = 0.36 + ((index - 1) / total_accepted) * 0.56
         step_progress = 0.56 / total_accepted
         bc_dir = out / "03_barcodes" / bc
@@ -642,7 +660,7 @@ def main() -> int:
         filtered = bc_dir / f"{bc}.filtered.fastq"
         progress_event(progress_path, "read_qc", "running", base_progress + step_progress * 0.05,
                        f"Filtering reads for {bc}", bc)
-        stats = write_filtered_fastq(fq, filtered, args.min_read_length, args.min_qscore)
+        stats = write_filtered_fastqs(fqs, filtered, args.min_read_length, args.min_qscore)
         if stats["kept_reads"] < args.min_assembly_reads:
             failed.append(f"{bc}: too few reads after read QC ({stats['kept_reads']} < {args.min_assembly_reads})")
             per_barcode.append({"barcode": bc, **stats, "status": "failed_read_qc"})
