@@ -10,7 +10,9 @@ import gzip
 import json
 import os
 import platform
+import pty
 import re
+import select
 import shutil
 import statistics
 import subprocess
@@ -50,18 +52,178 @@ def progress_event(path: Path, phase: str, status: str, progress: float, message
     print(f"PROGRESS {event['progress']:.3f} {phase} {status}: {message}", flush=True)
 
 
-def run(cmd: list[str], log: Path, cwd: Path | None = None, stdout: Path | None = None) -> None:
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+ENV_PYTHON_RE = re.compile(r"(/[^\s'\"`]+/envs/plasmid-pipeline/bin/python)")
+RACON_PROGRESS_RE = re.compile(r"\[[=>\s]+\]\s*\d+(?:\.\d+)?\s*s$")
+
+
+def clean_terminal_text(text: str) -> str:
+    text = ANSI_RE.sub("", text)
+    text = text.replace("\x1b[J", "").replace("\x1b[K", "")
+    return text.strip()
+
+
+def parse_percent(text: str) -> float | None:
+    matches = re.findall(r"(\d+(?:\.\d+)?)\s*%", text)
+    if not matches:
+        return None
+    value = float(matches[-1])
+    if 0 <= value <= 100:
+        return value / 100
+    return None
+
+
+def clean_process_output(data: bytes, tool: str) -> str:
+    text = data.decode("utf-8", errors="replace")
+    text = ANSI_RE.sub("", text)
+    lines: list[str] = []
+    previous = None
+    for raw in re.split(r"[\r\n]+", text):
+        line = raw.strip()
+        if not line:
+            continue
+        if tool == "racon" and RACON_PROGRESS_RE.search(line):
+            continue
+        if line == previous:
+            continue
+        lines.append(line)
+        previous = line
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def run_streaming(cmd: list[str], log: Path, cwd: Path | None = None, stdout: Path | None = None,
+                  progress_path: Path | None = None, progress_phase: str = "dorado",
+                  progress_start: float = 0.0, progress_end: float = 1.0) -> None:
     line = " ".join(map(str, cmd))
     with log.open("a") as handle:
         handle.write(f"\n[{now()}] $ {line}\n")
     env = os.environ.copy()
     env["PATH"] = f"{ENV / 'bin'}:{TOOLS / 'dorado' / 'current' / 'bin'}:{env.get('PATH', '')}"
+
+    master_fd, slave_fd = pty.openpty()
+    out_handle = stdout.open("wb") if stdout else None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            stdout=out_handle if out_handle else slave_fd,
+            stderr=slave_fd,
+            stdin=subprocess.DEVNULL,
+            env=env,
+            close_fds=True,
+        )
+        os.close(slave_fd)
+        slave_fd = -1
+        buffer = ""
+        last_emit = 0.0
+        last_log = 0.0
+        last_message = ""
+        last_pct: float | None = None
+        last_logged_pct: float | None = None
+
+        def handle_terminal_message(raw: str, log_handle) -> None:
+            nonlocal last_emit, last_log, last_message, last_pct, last_logged_pct
+            message = clean_terminal_text(raw)
+            if not message:
+                return
+            now_ts = dt.datetime.now().timestamp()
+            lowered = message.lower()
+            interesting = any(token in lowered for token in (
+                "eta", "%", "basecall", "demux", "download", "finish", "read", "sample",
+                "error", "failed", "warning", "exception",
+            ))
+            pct = parse_percent(message)
+
+            emit_progress = False
+            if progress_path:
+                if pct is not None:
+                    emit_progress = last_pct is None or abs(pct - last_pct) >= 0.01 or pct >= 0.999
+                elif interesting and message != last_message and now_ts - last_emit >= 3:
+                    emit_progress = True
+            if emit_progress:
+                progress = progress_start
+                if pct is not None:
+                    progress = progress_start + (progress_end - progress_start) * pct
+                    last_pct = pct
+                last_emit = now_ts
+                last_message = message
+                progress_event(progress_path, progress_phase, "running", progress, message)
+
+            log_progress = False
+            if pct is not None:
+                log_progress = last_logged_pct is None or abs(pct - last_logged_pct) >= 0.05 or pct >= 0.999
+            elif interesting and message != last_message and now_ts - last_log >= 5:
+                log_progress = True
+            if log_progress:
+                if pct is not None:
+                    last_logged_pct = pct
+                last_log = now_ts
+                log_handle.write(f"[{now()}] dorado {progress_phase}: {message}\n")
+                log_handle.flush()
+
+        with log.open("a") as log_handle:
+            while True:
+                ready, _, _ = select.select([master_fd], [], [], 0.2)
+                if ready:
+                    try:
+                        chunk = os.read(master_fd, 4096)
+                    except OSError:
+                        chunk = b""
+                    if not chunk:
+                        break
+                    text = chunk.decode("utf-8", errors="replace")
+                    buffer += text
+                    parts = re.split(r"[\r\n]+", buffer)
+                    buffer = parts.pop() if parts else ""
+                    for part in parts:
+                        handle_terminal_message(part, log_handle)
+                if proc.poll() is not None:
+                    try:
+                        while True:
+                            chunk = os.read(master_fd, 4096)
+                            if not chunk:
+                                break
+                            text = chunk.decode("utf-8", errors="replace")
+                            buffer += text
+                    except OSError:
+                        pass
+                    break
+            for part in re.split(r"[\r\n]+", buffer):
+                handle_terminal_message(part, log_handle)
+        if proc.wait():
+            raise RuntimeError(f"command failed ({proc.returncode}): {line}")
+    finally:
+        if slave_fd != -1:
+            os.close(slave_fd)
+        os.close(master_fd)
+        if out_handle:
+            out_handle.close()
+
+
+def run(cmd: list[str], log: Path, cwd: Path | None = None, stdout: Path | None = None,
+        progress_path: Path | None = None, progress_phase: str = "task",
+        progress_start: float = 0.0, progress_end: float = 1.0) -> None:
+    if Path(cmd[0]).name == "dorado":
+        run_streaming(cmd, log, cwd=cwd, stdout=stdout, progress_path=progress_path,
+                      progress_phase=progress_phase, progress_start=progress_start,
+                      progress_end=progress_end)
+        return
+    line = " ".join(map(str, cmd))
+    with log.open("a") as handle:
+        handle.write(f"\n[{now()}] $ {line}\n")
+    env = os.environ.copy()
+    env["PATH"] = f"{ENV / 'bin'}:{TOOLS / 'dorado' / 'current' / 'bin'}:{env.get('PATH', '')}"
+    tool = Path(cmd[0]).name
     if stdout:
-        with stdout.open("wb") as out, log.open("ab") as err:
-            proc = subprocess.run(cmd, cwd=cwd, stdout=out, stderr=err, env=env)
+        with stdout.open("wb") as out:
+            proc = subprocess.run(cmd, cwd=cwd, stdout=out, stderr=subprocess.PIPE, env=env)
+        cleaned = clean_process_output(proc.stderr or b"", tool)
     else:
-        with log.open("ab") as err:
-            proc = subprocess.run(cmd, cwd=cwd, stdout=err, stderr=err, env=env)
+        proc = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+        cleaned = clean_process_output(proc.stdout or b"", tool)
+    if cleaned:
+        with log.open("a") as handle:
+            handle.write(cleaned)
     if proc.returncode:
         raise RuntimeError(f"command failed ({proc.returncode}): {line}")
 
@@ -70,7 +232,7 @@ def cmd_output(cmd: list[str]) -> str:
     try:
         env = os.environ.copy()
         env.setdefault("PYTHONWARNINGS", "ignore::UserWarning")
-        return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, env=env).strip()
+        return subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, env=env, timeout=30).strip()
     except Exception as exc:
         return f"unavailable: {exc}"
 
@@ -84,6 +246,18 @@ def tool_version(path: str) -> str:
     return "available"
 
 
+def stale_env_wrapper(path: Path) -> str | None:
+    try:
+        text = path.read_text(errors="ignore")[:4096]
+    except Exception:
+        return None
+    for match in ENV_PYTHON_RE.finditer(text):
+        referenced = Path(match.group(1))
+        if referenced != ENV / "bin" / "python":
+            return f"wrapper references Python from another checkout: {referenced}"
+    return None
+
+
 def find_tool(name: str, prefer_env: bool = True) -> str | None:
     paths = []
     if prefer_env:
@@ -91,8 +265,52 @@ def find_tool(name: str, prefer_env: bool = True) -> str | None:
     paths.extend([TOOLS / "dorado" / "current" / "bin" / name, Path("/bin") / name])
     for path in paths:
         if path.exists() and os.access(path, os.X_OK):
+            if stale_env_wrapper(path):
+                continue
             return str(path)
-    return shutil.which(name)
+    found = shutil.which(name)
+    if found and stale_env_wrapper(Path(found)):
+        return None
+    return found
+
+
+def plannotate_usable(path: str | None) -> bool:
+    if not path:
+        return False
+    python = ENV / "bin" / "python"
+    if not python.exists():
+        return False
+    try:
+        env = os.environ.copy()
+        env.setdefault("PYTHONWARNINGS", "ignore::UserWarning")
+        env.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+        subprocess.check_output(
+            [str(python), "-c", "import streamlit.cli; from plannotate.pLannotate import main"],
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def install_tools_if_needed(log: Path, missing: list[str]) -> None:
+    installer = ROOT / "scripts" / "install_tools.sh"
+    if not installer.exists():
+        with log.open("a") as handle:
+            handle.write(f"[{now()}] Tool installer is missing: {installer}\n")
+        return
+    with log.open("a") as handle:
+        handle.write(f"[{now()}] Attempting project-local tool installation for: {', '.join(missing)}\n")
+        handle.write(f"\n[{now()}] $ bash {installer}\n")
+    env = os.environ.copy()
+    env["PATH"] = f"{ENV / 'bin'}:{TOOLS / 'dorado' / 'current' / 'bin'}:{env.get('PATH', '')}"
+    with log.open("ab") as err:
+        proc = subprocess.run(["bash", str(installer)], cwd=ROOT, stdout=err, stderr=err, env=env)
+    with log.open("a") as handle:
+        handle.write(f"[{now()}] Tool installer exited with code {proc.returncode}\n")
 
 
 def version_tuple(text: str) -> tuple[int, ...]:
@@ -472,8 +690,11 @@ def render_html_png(html: Path, png: Path, log: Path) -> bool:
         line = " ".join(map(str, cmd))
         with log.open("a") as handle:
             handle.write(f"\n[{now()}] $ {line}\n")
-        with log.open("ab") as err:
-            proc = subprocess.run(cmd, stderr=err, stdout=err, env=env)
+        proc = subprocess.run(cmd, stderr=subprocess.STDOUT, stdout=subprocess.PIPE, env=env)
+        cleaned = clean_process_output(proc.stdout or b"", Path(browser).name)
+        if cleaned:
+            with log.open("a") as handle:
+                handle.write(cleaned)
         if proc.returncode:
             raise RuntimeError(f"command failed ({proc.returncode}): {line}")
         return png.exists() and png.stat().st_size > 0
@@ -496,8 +717,11 @@ def annotate(plannotate: str, fasta: Path, out_dir: Path, log: Path, db: Path | 
             line = " ".join(map(str, cmd))
             with log.open("a") as handle:
                 handle.write(f"\n[{now()}] $ {line}\n")
-            with log.open("ab") as err:
-                proc = subprocess.run(cmd, stderr=err, stdout=err, env=env)
+            proc = subprocess.run(cmd, stderr=subprocess.STDOUT, stdout=subprocess.PIPE, env=env)
+            cleaned = clean_process_output(proc.stdout or b"", "plannotate")
+            if cleaned:
+                with log.open("a") as handle:
+                    handle.write(cleaned)
             if proc.returncode:
                 raise RuntimeError(f"command failed ({proc.returncode}): {line}")
             result["status"] = "completed"
@@ -532,8 +756,8 @@ def main() -> int:
     parser.add_argument("--threads", type=int, default=max(1, os.cpu_count() or 1))
     parser.add_argument("--min-qscore", type=float, default=9)
     parser.add_argument("--min-read-length", type=int, default=700)
-    parser.add_argument("--min-barcode-reads", type=int, default=100)
-    parser.add_argument("--min-assembly-reads", type=int, default=3,
+    parser.add_argument("--min-barcode-reads", type=int, default=20)
+    parser.add_argument("--min-assembly-reads", type=int, default=2,
                         help="Minimum reads remaining after length/QC filtering before assembly is attempted")
     parser.add_argument("--min-barcode-fraction", type=float, default=0.01)
     parser.add_argument("--min-contig-length", type=int, default=1000)
@@ -560,10 +784,44 @@ def main() -> int:
     racon = find_tool("racon")
     plannotate = find_tool("plannotate")
     seqkit = find_tool("seqkit")
+    plannotate_broken = bool(plannotate and not plannotate_usable(plannotate))
+    if plannotate_broken:
+        with log.open("a") as handle:
+            handle.write(f"[{now()}] pLannotate exists but is not runnable with current dependencies: {plannotate}\n")
+        plannotate = None
     required = {"flye": flye, "minimap2": minimap2, "samtools": samtools}
+    install_missing = [name for name, path in {**required, "racon": racon, "seqkit": seqkit, "plannotate": plannotate}.items() if not path]
+    if install_missing:
+        install_tools_if_needed(log, install_missing)
+        flye = find_tool("flye")
+        minimap2 = find_tool("minimap2")
+        samtools = find_tool("samtools")
+        racon = find_tool("racon")
+        plannotate = find_tool("plannotate")
+        seqkit = find_tool("seqkit")
+        if plannotate and not plannotate_usable(plannotate):
+            with log.open("a") as handle:
+                handle.write(f"[{now()}] pLannotate remains unusable after installation attempt: {plannotate}\n")
+            plannotate = None
+        required = {"flye": flye, "minimap2": minimap2, "samtools": samtools}
+    with log.open("a") as handle:
+        handle.write(f"[{now()}] Tool paths:\n")
+        for name, path in {
+            "dorado": dorado,
+            "flye": flye,
+            "minimap2": minimap2,
+            "samtools": samtools,
+            "racon": racon,
+            "seqkit": seqkit,
+            "plannotate": plannotate,
+        }.items():
+            handle.write(f"[{now()}]   {name}: {path or 'not found'}\n")
     missing = [k for k, v in required.items() if not v]
     if missing:
         raise RuntimeError(f"missing required tools after install attempt: {', '.join(missing)}. Run scripts/install_tools.sh")
+    if not plannotate:
+        with log.open("a") as handle:
+            handle.write(f"[{now()}] pLannotate is not available after installation attempt; annotation will be reported pending.\n")
     progress_event(progress_path, "setup", "completed", 0.08, "Required tools are available")
 
     run_dir = args.input_run.resolve()
@@ -573,7 +831,7 @@ def main() -> int:
     elif (run_dir / "pod5").exists() and list((run_dir / "pod5").rglob("*.pod5")):
         pod5_dir = run_dir / "pod5"
     elif pod5_files:
-        pod5_dir = run_dir
+        pod5_dir = Path(os.path.commonpath([str(path.parent) for path in pod5_files]))
     else:
         pod5_dir = run_dir / "pod5"
     completed, failed, pending = [], [], []
@@ -598,10 +856,13 @@ def main() -> int:
         if not calls_bam.exists():
             progress_event(progress_path, "basecalling", "running", 0.10, "Downloading/checking Dorado model")
             run([dorado, "download", "--model", args.model, "--data", str(pod5_dir), "--recursive",
-                 "--models-directory", str(models_dir)], log)
+                 "--models-directory", str(models_dir)], log, progress_path=progress_path,
+                progress_phase="dorado_download", progress_start=0.10, progress_end=0.12)
             progress_event(progress_path, "basecalling", "running", 0.12, "Basecalling POD5 files with Dorado")
-            run([dorado, "basecaller", args.model, str(pod5_dir), "--recursive", "--kit-name", kit,
-                 "--device", args.device, "--models-directory", str(models_dir)], log, stdout=calls_bam)
+            run([dorado, "basecaller", args.model, str(pod5_dir), "--recursive", "--no-trim",
+                 "--device", args.device, "--models-directory", str(models_dir)], log, stdout=calls_bam,
+                progress_path=progress_path, progress_phase="dorado_basecalling",
+                progress_start=0.12, progress_end=0.18)
         progress_event(progress_path, "basecalling", "completed", 0.18, f"Basecalled reads: {calls_bam}")
         completed.append(f"Basecalled POD5 with Dorado: {calls_bam}")
 
@@ -611,7 +872,9 @@ def main() -> int:
         if not demux_fastqs(demux_dir):
             progress_event(progress_path, "demultiplexing", "running", 0.20, "Demultiplexing reads with Dorado")
             run([dorado, "demux", "--kit-name", kit, "--emit-fastq", "--emit-summary",
-                 "--threads", str(args.threads), "--output-dir", str(demux_dir), str(calls_bam)], log)
+                 "--threads", str(args.threads), "--output-dir", str(demux_dir), str(calls_bam)], log,
+                progress_path=progress_path, progress_phase="dorado_demux",
+                progress_start=0.20, progress_end=0.28)
     progress_event(progress_path, "demultiplexing", "completed", 0.28, f"Demultiplexed reads: {demux_dir}")
     completed.append(f"Demultiplexed reads: {demux_dir}")
 

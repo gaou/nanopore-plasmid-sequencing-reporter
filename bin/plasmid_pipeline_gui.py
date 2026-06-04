@@ -69,20 +69,23 @@ class PipelineGui(tk.Tk):
         self.summary: dict = {}
         self.barcode_records: list[dict] = []
         self.current_image: tk.PhotoImage | None = None
+        self.output_manually_set = False
 
         self.run_folder = tk.StringVar(value=str(ROOT))
         self.output_folder = tk.StringVar(value="")
-        self.demux_folder = tk.StringVar(value="")
         self.kit_name = tk.StringVar(value="SQK-RBK114-24")
         self.model = tk.StringVar(value="sup")
         self.threads = tk.IntVar(value=max(1, (os.cpu_count() or 1) // 2))
         self.min_qscore = tk.DoubleVar(value=9.0)
-        self.min_barcode_reads = tk.IntVar(value=100)
+        self.min_barcode_reads = tk.IntVar(value=20)
+        self.min_assembly_reads = tk.IntVar(value=2)
         self.skip_dorado_update = tk.BooleanVar(value=False)
         self.status_text = tk.StringVar(value="Select a run folder to begin.")
         self.progress_value = tk.DoubleVar(value=0.0)
 
         self._build_ui()
+        self.run_folder.trace_add("write", self.on_run_folder_changed)
+        self.output_folder.set(str(self.default_output(Path(self.run_folder.get()).expanduser())))
         self.after(300, self._poll)
 
     def _build_ui(self) -> None:
@@ -100,12 +103,8 @@ class PipelineGui(tk.Tk):
         ttk.Entry(controls, textvariable=self.output_folder).grid(row=1, column=1, sticky="ew", padx=8, pady=(6, 0))
         ttk.Button(controls, text="Browse...", command=self.choose_output_folder).grid(row=1, column=2, pady=(6, 0))
 
-        ttk.Label(controls, text="Existing demux FASTQs").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(controls, textvariable=self.demux_folder).grid(row=2, column=1, sticky="ew", padx=8, pady=(6, 0))
-        ttk.Button(controls, text="Browse...", command=self.choose_demux_folder).grid(row=2, column=2, pady=(6, 0))
-
         options = ttk.Frame(controls)
-        options.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        options.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         ttk.Label(options, text="Kit").pack(side=LEFT)
         ttk.Entry(options, textvariable=self.kit_name, width=18).pack(side=LEFT, padx=(4, 14))
         ttk.Label(options, text="Model").pack(side=LEFT)
@@ -116,10 +115,12 @@ class PipelineGui(tk.Tk):
         ttk.Spinbox(options, textvariable=self.min_qscore, from_=0, to=30, increment=0.5, width=6).pack(side=LEFT, padx=(4, 14))
         ttk.Label(options, text="Min barcode reads").pack(side=LEFT)
         ttk.Spinbox(options, textvariable=self.min_barcode_reads, from_=1, to=100000, increment=10, width=8).pack(side=LEFT, padx=(4, 14))
+        ttk.Label(options, text="Min assembly reads").pack(side=LEFT)
+        ttk.Spinbox(options, textvariable=self.min_assembly_reads, from_=1, to=1000, increment=1, width=6).pack(side=LEFT, padx=(4, 14))
         ttk.Checkbutton(options, text="Skip Dorado update check", variable=self.skip_dorado_update).pack(side=LEFT)
 
         buttons = ttk.Frame(controls)
-        buttons.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        buttons.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(10, 0))
         self.run_button = ttk.Button(buttons, text="Run Pipeline", command=self.run_pipeline)
         self.run_button.pack(side=LEFT)
         self.stop_button = ttk.Button(buttons, text="Stop", command=self.stop_pipeline, state="disabled")
@@ -190,16 +191,77 @@ class PipelineGui(tk.Tk):
     def choose_output_folder(self) -> None:
         folder = filedialog.askdirectory(initialdir=str(ROOT / "results"), title="Select output folder")
         if folder:
+            self.output_manually_set = True
             self.output_folder.set(folder)
 
-    def choose_demux_folder(self) -> None:
-        folder = filedialog.askdirectory(initialdir=self.run_folder.get() or str(ROOT), title="Select existing demultiplexed FASTQ folder")
-        if folder:
-            self.demux_folder.set(folder)
+    def on_run_folder_changed(self, *_args: object) -> None:
+        if self.output_manually_set:
+            return
+        try:
+            run_dir = Path(self.run_folder.get()).expanduser()
+        except Exception:
+            run_dir = ROOT
+        self.output_folder.set(str(self.default_output(run_dir)))
 
-    def default_output(self) -> Path:
+    def default_output(self, run_dir: Path | None = None) -> Path:
         stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        return ROOT / "results" / f"plasmid_pipeline_gui_{stamp}"
+        base = (run_dir or Path(self.run_folder.get()).expanduser()).resolve()
+        if base.is_file():
+            base = base.parent
+        return base / f"nanopore_plasmid_reporter_results_{stamp}"
+
+    def wrapper_is_stale(self, path: Path) -> bool:
+        try:
+            text = path.read_text(errors="ignore")[:4096]
+        except Exception:
+            return False
+        marker = "/envs/plasmid-pipeline/bin/python"
+        return marker in text and str(ENV_PYTHON) not in text
+
+    def installation_needs_refresh(self) -> bool:
+        env_dir = ROOT / "envs" / "plasmid-pipeline"
+        for name in ("python", "flye", "minimap2", "samtools", "racon", "seqkit", "plannotate"):
+            path = env_dir / "bin" / name
+            if not path.exists() or not os.access(path, os.X_OK):
+                return True
+            if self.wrapper_is_stale(path):
+                return True
+        try:
+            env = os.environ.copy()
+            env.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+            subprocess.check_output(
+                [str(ENV_PYTHON), "-c", "import streamlit.cli; from plannotate.pLannotate import main"],
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+                timeout=30,
+            )
+        except Exception:
+            return True
+        return False
+
+    def ensure_installation(self) -> None:
+        if not self.installation_needs_refresh():
+            return
+        installer = ROOT / "scripts" / "install_tools.sh"
+        if not installer.exists():
+            self.log_text.insert(END, f"Installer not found: {installer}\n")
+            self.log_text.see(END)
+            return
+        self.status_text.set("Installing or repairing local tools...")
+        self.log_text.insert(END, f"Local tool environment is missing or stale; running {installer}\n")
+        self.log_text.see(END)
+        self.update_idletasks()
+        proc = subprocess.run(
+            ["bash", str(installer)],
+            cwd=ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        self.log_text.insert(END, proc.stdout)
+        self.log_text.insert(END, f"\nInstaller exited with code {proc.returncode}\n")
+        self.log_text.see(END)
 
     def run_pipeline(self) -> None:
         run_dir = Path(self.run_folder.get()).expanduser()
@@ -222,6 +284,7 @@ class PipelineGui(tk.Tk):
         self.task_rows.clear()
         self.progress_value.set(0)
         self.status_text.set("Starting pipeline...")
+        self.ensure_installation()
 
         python = ENV_PYTHON if ENV_PYTHON.exists() else Path(sys.executable)
         cmd = [
@@ -233,15 +296,10 @@ class PipelineGui(tk.Tk):
             "--threads", str(self.threads.get()),
             "--min-qscore", str(self.min_qscore.get()),
             "--min-barcode-reads", str(self.min_barcode_reads.get()),
+            "--min-assembly-reads", str(self.min_assembly_reads.get()),
         ]
         if self.skip_dorado_update.get():
             cmd.append("--skip-dorado-update")
-        if self.demux_folder.get().strip():
-            demux_dir = Path(self.demux_folder.get()).expanduser()
-            if not demux_dir.exists():
-                messagebox.showerror("Demux folder not found", f"Folder does not exist:\n{demux_dir}")
-                return
-            cmd.extend(["--demux-dir", str(demux_dir)])
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         env = os.environ.copy()
@@ -296,6 +354,8 @@ class PipelineGui(tk.Tk):
                 line = self.stdout_queue.get_nowait()
             except queue.Empty:
                 break
+            if line.startswith("PROGRESS ") or line.startswith("DORADO "):
+                continue
             self.log_text.insert(END, line)
             self.log_text.see(END)
 

@@ -53,6 +53,8 @@ bash scripts/install_tools.sh
 
 The installer does not use `sudo`. It creates `envs/plasmid-pipeline/`, prepares required command-line tools, patches pLannotate for current dependency compatibility, and attempts pLannotate database setup. Dorado itself is checked by the pipeline once per day and downloaded under `tools/dorado/current` when needed.
 
+If this repository is copied or moved after a previous installation, run `bash scripts/install_tools.sh` again. Conda command wrappers are not safely relocatable; the installer detects stale wrappers that point to another checkout and rebuilds `envs/plasmid-pipeline/` when needed.
+
 Generated dependency directories are intentionally excluded from git:
 
 - `envs/`
@@ -73,17 +75,16 @@ Typical GUI workflow:
 
 1. Click `Browse...` beside `Run folder`.
 2. Select the ONT run directory. You can select the folder that directly contains `pod5/`, or a parent folder; the software searches recursively for `.pod5` files.
-3. Optional: choose an existing demultiplexed FASTQ folder in `Existing demux FASTQs`. Use this when a previous MinKNOW/Guppy/Dorado basecalling output already contains folders such as `basecalling/pass/barcode04/*.fastq.gz`. When this is set, the pipeline skips basecalling and demultiplexing.
-4. Leave `Kit` as `SQK-RBK114-24` for rapid barcode 114.24 plasmid runs.
-5. Choose the Dorado model:
+3. Leave `Kit` as `SQK-RBK114-24` for rapid barcode 114.24 plasmid runs.
+4. Choose the Dorado model:
    - `sup`: best accuracy, slowest.
    - `hac`: faster, lower accuracy.
    - `fast`: fastest, lowest accuracy.
-6. Set threads according to the machine.
-7. Click `Run Pipeline`.
-8. Watch the progress bar and task table.
-9. When the run finishes, select barcodes in the left panel to view the plasmid PNG map and representative FASTA.
-10. Click `Save As...` to write a zip package for sharing or archiving.
+5. Set threads according to the machine.
+6. Click `Run Pipeline`.
+7. Watch the progress bar and task table. During Dorado basecalling/demultiplexing, Dorado's own terminal progress/ETA output is mirrored into the status/task area when Dorado emits it; the run log is kept readable.
+8. When the run finishes, select barcodes in the left panel to view the plasmid PNG map and representative FASTA.
+9. Click `Save As...` to write a zip package for sharing or archiving.
 
 The GUI result package includes:
 
@@ -172,7 +173,7 @@ envs/plasmid-pipeline/bin/python bin/plasmid_pipeline.py \
   --model sup \
   --threads 16 \
   --min-barcode-reads 20 \
-  --min-assembly-reads 3 \
+  --min-assembly-reads 2 \
   --min-qscore 7
 ```
 
@@ -252,6 +253,8 @@ The installer does not use `sudo`. It prefers conda, mamba, or micromamba, and i
 - `resources/functional_annotation_db/` where applicable
 
 Dorado is checked by the pipeline once per day and updated under `tools/dorado/current` when a newer release is available. These installed/downloaded files are local runtime artifacts, not source files for GitHub.
+
+If a copied checkout still contains an old `envs/` directory, rerun `bash scripts/install_tools.sh` or start the GUI with `scripts/run_gui.sh`. The launcher checks for incomplete or non-relocatable local environments before opening the GUI.
 
 ## Troubleshooting
 
