@@ -318,6 +318,14 @@ def version_tuple(text: str) -> tuple[int, ...]:
     return tuple(int(x) for x in m.group(1).split(".")) if m else tuple()
 
 
+def default_model_for_dorado(dorado: str, log: Path) -> str:
+    version = cmd_output([dorado, "--version"])
+    model = "hac" if version_tuple(version) > (2, 0, 0) else "sup"
+    with log.open("a") as handle:
+        handle.write(f"[{now()}] Dorado version for automatic model selection: {version!r}; model={model}\n")
+    return model
+
+
 def latest_dorado_release(log: Path) -> dict | None:
     try:
         with urllib.request.urlopen(DORADO_REPO, timeout=30) as response:
@@ -751,7 +759,9 @@ def main() -> int:
     parser.add_argument("--input-run", required=True, type=Path, help="ONT run directory containing pod5/ or a POD5 directory")
     parser.add_argument("--output", type=Path, default=ROOT / "results" / f"plasmid_pipeline_{dt.datetime.now():%Y%m%d_%H%M%S}")
     parser.add_argument("--kit-name", default="SQK-RBK114-24")
-    parser.add_argument("--model", default="sup", help="Dorado model selector, e.g. sup, hac, fast, or a model path")
+    parser.add_argument("--model", default="auto",
+                        help="Dorado model selector: auto, sup, hac, fast, or a model path. "
+                             "auto uses hac for Dorado >2.0.0 and sup for older Dorado.")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--threads", type=int, default=max(1, os.cpu_count() or 1))
     parser.add_argument("--min-qscore", type=float, default=9)
@@ -778,6 +788,8 @@ def main() -> int:
 
     kit = normalize_kit(args.kit_name)
     dorado = ensure_dorado(args, log)
+    if not args.model or args.model == "auto":
+        args.model = default_model_for_dorado(dorado, log)
     flye = find_tool("flye")
     minimap2 = find_tool("minimap2")
     samtools = find_tool("samtools")

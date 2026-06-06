@@ -77,6 +77,7 @@ Typical GUI workflow:
 2. Select the ONT run directory. You can select the folder that directly contains `pod5/`, or a parent folder; the software searches recursively for `.pod5` files.
 3. Leave `Kit` as `SQK-RBK114-24` for rapid barcode 114.24 plasmid runs.
 4. Choose the Dorado model:
+   - `auto`: default; uses `hac` for Dorado >2.0.0 and `sup` for older Dorado.
    - `sup`: best accuracy, slowest.
    - `hac`: faster, lower accuracy.
    - `fast`: fastest, lowest accuracy.
@@ -103,7 +104,6 @@ Run from raw POD5 files:
 envs/plasmid-pipeline/bin/python bin/plasmid_pipeline.py \
   --input-run /path/to/ont_run_folder \
   --kit-name SQK-RBK114-24 \
-  --model sup \
   --threads 16
 ```
 
@@ -113,7 +113,6 @@ Run from the current directory while searching all subfolders for POD5 files:
 envs/plasmid-pipeline/bin/python bin/plasmid_pipeline.py \
   --input-run . \
   --kit-name SQK-RBK114-24 \
-  --model sup \
   --threads 16
 ```
 
@@ -123,7 +122,6 @@ Reuse previous Dorado basecalling and demultiplexing, avoiding another Dorado ru
 envs/plasmid-pipeline/bin/python bin/plasmid_pipeline.py \
   --input-run . \
   --kit-name SQK-RBK114-24 \
-  --model sup \
   --threads 16 \
   --basecalled-bam results/previous_run/01_basecalling/calls.bam \
   --demux-dir results/previous_run/02_demux \
@@ -182,7 +180,7 @@ envs/plasmid-pipeline/bin/python bin/plasmid_pipeline.py \
 - `--input-run`: ONT run directory, parent folder, POD5 directory, or a single `.pod5` file.
 - `--output`: result directory. If omitted, a timestamped directory is created under `results/`.
 - `--kit-name`: Dorado kit name. For SQK-RBK114.24 use `SQK-RBK114-24`.
-- `--model`: Dorado model selector such as `sup`, `hac`, or `fast`.
+- `--model`: Dorado model selector: `auto`, `sup`, `hac`, `fast`, or a full model path. The default `auto` uses `hac` for Dorado >2.0.0 and `sup` for older Dorado.
 - `--device`: Dorado device, for example `auto`, `cpu`, `cuda:0`, or `cuda:all`.
 - `--threads`: thread count for assembly/polishing/demux steps.
 - `--basecalled-bam`: reuse an existing Dorado BAM and skip basecalling.
